@@ -34,6 +34,20 @@ proc_mapstacks(pagetable_t kpgtbl) {
   struct proc *p;
   
   for(p = proc; p < &proc[NPROC]; p++) {
+
+// lab4-3
+uint64 sys_sigreturn(void) {
+    struct proc* p = myproc();
+    // trapframecopy must have the copy of trapframe
+    if(p->trapframecopy != p->trapframe + 512) {
+        return -1;
+    }
+    memmove(p->trapframe, p->trapframecopy, sizeof(struct trapframe));   // restore the trapframe
+    p->passedticks = 0;     // prevent re-entrant
+    p->trapframecopy = 0;    // 置零
+    return p->trapframe->a0;	// 返回a0,避免被返回值覆盖
+}
+
     char *pa = kalloc();
     if(pa == 0)
       panic("kalloc");
@@ -93,7 +107,7 @@ allocpid() {
   pid = nextpid;
   nextpid = nextpid + 1;
   release(&pid_lock);
-
+  
   return pid;
 }
 
@@ -140,7 +154,10 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
+  p->interval = 0;
+  p->handler = 0;
+  p->passedticks = 0;
+  p->trapframecopy = 0;
   return p;
 }
 

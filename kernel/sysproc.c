@@ -95,3 +95,50 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64 
+sys_sigalarm(void) {
+    int interval;
+    uint64 handler;
+    struct proc *p;
+    // 要求时间间隔非负
+    if (argint(0, &interval) < 0 || argaddr(1, &handler) < 0 || interval < 0) {
+        return -1;
+    }
+    p = myproc();
+    p->interval = interval;
+    p->handler = handler;
+    p->passedticks = 0;    // 重置过去时钟数
+
+    return 0;
+}
+
+
+
+
+
+uint64 
+sys_sigreturn(void) {
+    // 获取当前进程的指针
+    struct proc* p = myproc();
+
+    // 检查保存的 trapframe 是否是正确的（即是否在 trapframe 地址加上 512 的位置）
+    if (p->trapframecopy != p->trapframe + 512) {
+        // 如果保存的 trapframe 地址不匹配，返回错误码 -1
+        return -1;
+    }
+
+    // 恢复 trapframe 的内容到原始位置
+    // 将保存的 trapframe 内容复制回到当前的 trapframe 中
+    memmove(p->trapframe, p->trapframecopy, sizeof(struct trapframe));
+
+    // 重置进程的 passedticks 计数器为 0
+    p->passedticks = 0;
+
+    // 将 trapframecopy 设置为 0，表示不再需要这个副本
+    p->trapframecopy = 0;    
+
+    // 返回 a0 寄存器的值，a0 通常用于存放系统调用的返回值
+    return p->trapframe->a0;  
+}
+

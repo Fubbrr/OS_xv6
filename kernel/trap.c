@@ -76,6 +76,27 @@ usertrap(void)
   if(p->killed)
     exit(-1);
 
+  if (which_dev == 2) {   // timer interrupt
+    // 如果当前中断是定时器中断（假设 which_dev == 2 表示定时器中断）
+
+    // 增加已过去的时钟周期数
+    if (p->interval != 0 && ++p->passedticks == p->interval) {
+        // 检查是否设置了定时器间隔，并且已过去的时钟周期数等于间隔
+
+        // 使用 trapframe 后的一部分内存，trapframe 大小为 288 字节，因此只要在 trapframe 地址后 288 字节以上的地址都可，此处使用 512 字节只是为了取整数幂
+        // 将 trapframe 结构体的内容复制到 p->trapframecopy
+        p->trapframecopy = p->trapframe + 512;  
+
+        // 复制当前的 trapframe 到新分配的内存区域
+        // 这样做是为了保存当前陷阱处理程序的状态，以便后续恢复
+        memmove(p->trapframecopy, p->trapframe, sizeof(struct trapframe));
+
+        // 设置陷阱处理程序的入口点
+        // 当返回到用户空间时，将执行 handler() 函数
+        p->trapframe->epc = p->handler;
+    }
+  }
+
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
     yield();
