@@ -6,6 +6,7 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "sysinfo.h"
 
 uint64
 sys_exit(void)
@@ -94,4 +95,27 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+// 系统调用实现，返回系统信息
+uint64
+sys_sysinfo(void)
+{
+  uint64 addr;            // 用户空间中接收系统信息的地址
+  struct sysinfo info;    // 用于存储系统信息的结构体
+  struct proc *p = myproc(); // 获取当前进程的指针
+
+  // 从系统调用参数中获取地址
+  if (argaddr(0, &addr) < 0)
+    return -1; // 获取地址失败，返回 -1 表示错误
+
+  // 获取系统信息
+  info.freemem = free_mem(); // 获取系统中空闲内存的总量
+  info.nproc = nproc();      // 获取系统中活跃进程的数量
+
+  // 将系统信息复制到用户空间的指定地址
+  if (copyout(p->pagetable, addr, (char *)&info, sizeof(info)) < 0)
+    return -1; // 复制失败，返回 -1 表示错误
+
+  return 0; // 成功，返回 0
 }

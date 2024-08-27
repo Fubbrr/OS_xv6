@@ -12,7 +12,7 @@ static char *syscall_names[] = {
   "read", "kill", "exec", "fstat", "chdir", 
   "dup", "getpid", "sbrk", "sleep", "uptime", 
   "open", "write", "mknod", "unlink", "link", 
-  "mkdir", "close", "trace"};
+  "mkdir", "close", "trace","sysinfo"};
 
 // Fetch the uint64 at addr from the current process.
 int
@@ -111,6 +111,7 @@ extern uint64 sys_unlink(void);
 extern uint64 sys_wait(void);
 extern uint64 sys_write(void);
 extern uint64 sys_uptime(void);
+extern uint64 sys_sysinfo(void);
 extern uint64 sys_trace(void);
 
 static uint64 (*syscalls[])(void) = {
@@ -135,6 +136,7 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+[SYS_sysinfo]   sys_sysinfo,
 [SYS_trace]   sys_trace,
 };
 

@@ -30,6 +30,37 @@ kinit()
   freerange(end, (void*)PHYSTOP);
 }
 
+uint64
+free_mem(void)
+{
+  struct run *r;
+  uint64 num = 0;
+
+  // 获取内存管理锁以确保线程安全
+  acquire(&kmem.lock);
+
+  // 指向空闲内存块的链表头
+  r = kmem.freelist;
+
+  // 遍历空闲内存块链表
+  while (r)
+  {
+    num++; // 每找到一个空闲内存块，计数器加1
+    r = r->next; // 移动到下一个内存块
+  }
+
+  // 释放内存管理锁
+  release(&kmem.lock);
+
+  // 返回空闲内存的总大小
+  // num 乘以每个页面的大小 PGSIZE
+  return num * PGSIZE;
+}
+
+
+
+
+
 void
 freerange(void *pa_start, void *pa_end)
 {
