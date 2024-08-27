@@ -2,7 +2,9 @@
 
 *2252426 付柏瑞*
 
-## Tools
+
+
+## Tools&Guidance
 
 **安装[适用于 Linux 的 Windows 子系统](https://docs.microsoft.com/en-us/windows/wsl/install-win10)**
 
@@ -40,10 +42,6 @@ sudo apt-get install git build-essential gdb-multiarch qemu-system-misc gcc-risc
   ```
 
 ![image-20240827022337692](./assets/image-20240827022337692.png)
-
-
-
-## Guidance
 
 一些指针常见习语特别值得记住：
 
@@ -379,25 +377,622 @@ xv6 没有 `ps` 命令，但是，如果您键入， 内核将打印有关每个
 1.进入user文件夹，创建primes.c 的文件，代码如下：
 
 ``````c
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+
+int main(int argc, char *argv[])
+{
+    //创建管道，管道的描述符分别是 p1[0] (读端) 和 p1[1] (写端)
+    int p1[2];
+    pipe(p1);
+
+    //创建一个子进程
+    int f1 = fork();
+
+    if (f1 < 0)
+    {
+        fprintf(2, "xargs: error in fork\n");
+        exit(1);
+    }
+
+    if (f1 == 0)
+    {
+        int prime = 0;
+        close(p1[1]); // 关闭主管道的写端，因为子进程只读
+
+        while (1)
+        {
+            // 从管道中读取数值
+            if (read(p1[0], &prime, sizeof(prime)) == 0)
+            {
+                // 如果管道读到 EOF（即父进程已经关闭了写端），关闭读端并退出
+                close(p1[0]);
+                exit(0);
+            }
+
+            // 输出当前读取到的素数
+            printf("prime %d\n", prime);
+
+            // 创建一个新的管道用于过滤掉当前素数的倍数
+            int p2[2];
+            pipe(p2);
+
+            // 创建一个新的子进程
+            int f2 = fork();
+            if (f2 < 0)
+            {
+                // 如果 fork 失败，输出错误信息并退出
+                fprintf(2, "xargs: error in fork\n");
+                exit(1);
+            }
+
+            if (f2 > 0)
+            {
+                // 父进程（新的子进程的父进程）
+                int num = 0;
+                close(p2[0]); // 关闭子管道的读端，因为父进程只写
+
+                // 从主管道中读取数据，并将不为当前素数倍数的数据写入子管道
+                while (read(p1[0], &num, sizeof(num)) != 0)
+                {
+                    if (num % prime != 0)
+                    {
+                        write(p2[1], &num, sizeof(num));
+                    }
+                }
+
+                // 关闭管道
+                close(p1[0]);
+                close(p2[1]);
+
+                // 等待子进程退出
+                wait(0);
+                exit(0);
+            }
+
+            // 孙进程部分
+            close(p1[0]); // 关闭主管道的读端
+            close(p2[1]); // 关闭子管道的写端
+            p1[0] = p2[0]; // 更新主管道的读端为子管道的读端
+        }
+    }
+
+    //关闭主管道的读端，因为父进程只写
+    close(p1[0]); 
+
+    //将 2 到 35 的整数写入管道
+    for (int i = 2; i <= 35; i++)
+    {
+        write(p1[1], &i, sizeof(i));
+    }
+
+    //关闭主管道的写端
+    close(p1[1]);
+
+    //等待子进程退出
+    wait(0);
+    exit(0);
+}
+
 ``````
 
 ![image-20240827042159485](./assets/image-20240827042159485.png)
 
+- **主进程**:
+
+  - 创建初始管道，并将 2 到 35 的整数写入管道。
+
+  - 关闭写端，等待子进程完成。
+
+- **第一个子进程**:
+
+  - 从主管道中读取数据，识别并打印素数。
+
+  - 创建新的管道和子进程，筛选掉当前素数的倍数。
+
+- **新子进程**:
+  - 从主管道中读取数据，筛选数据，将筛选后的数据写入新的子管道。
+
+- **管道和进程**:
+  - 使用管道在进程之间传递数据，通过递归创建子进程来实现素数筛选。
+
+- **关闭管道端口**: 
+  - 确保每个进程在适当的时机关闭不再使用的管道端口，防止资源泄漏或管道死锁。
+
+- **管道端口更新**: 
+  - 确保在新的子进程中正确更新管道的读端，以便继续处理数据流。
+
+2. 更新 Makefile
+
+   在 Makefile 中找到 UPROGS 变量的定义，并添加 find
+
+3. 实验结果
+
+![image-20240827184844179](./assets/image-20240827184844179.png)
+
+![image-20240827184807360](./assets/image-20240827184807360.png)
+
 #### 实验中遇到的问题和解决方法
 
+- **管道描述符错误使用**
+
+​	**问题**: 在代码中，写管道数据时错误地使用了错误的管道描述符。：
+
+```c
+write(p2[2], &num, sizeof(num));
+```
+
+​	此处 `p2[2]` 是错误的，正确的描述符应为 `p2[1]`，即管道的写端。
+
+​	**解决方法**: 确保在操作管道时使用正确的描述符。管道描述符的索引应为 0（读端）和 1（写端）。所以，正确的写操作应为：
+
+```c
+write(p2[1], &num, sizeof(num));
+```
+
+- **子进程和孙进程的管道管理**
+
+ 	**问题**: 在创建新管道并生成新的子进程时，没有正确关闭不再需要的管道端口，导致资源泄漏或死锁。
+
+​	 **解决方法**: 在每个进程中，确保关闭不再需要的管道端口。例如：
+
+```c
+close(p1[0]); // 关闭主管道的读端
+close(p2[1]); // 关闭子管道的写端
+```
+
+​	每个进程在操作管道时只保留需要的端口，其它端口应当关闭。
+
+- **进程同步问题**
+
+​	**问题**: 进程创建和数据处理时，如果进程间同步不正确，可能会导致数据丢失或程序行为不如预期。
+
+​	**解决方法**: 确保在进程结束之前，所有子进程都已完成它们的任务，并使用 `wait()` 来同步进程。在主进程中等待子进程完成，以确	保子进程正确地执行完毕。
+
+#### 4. **管道 EOF 处理**
+
+​	**问题**: 子进程在读取管道时可能会遇到 EOF（管道读端关闭），这时子进程需要正确地处理 EOF 并退出。
+
+​	**解决方法**: 检查 `read()` 的返回值，判断是否读取到 EOF。
+
+```c
+if (read(p1[0], &prime, sizeof(prime)) == 0)
+{
+    close(p1[0]);
+    exit(0);
+}
+```
+
+在读取到 EOF 时关闭管道读端并退出。
+
 #### 实验心得
+
+- **掌握了进程间通信（IPC）的基本技巧**:
+  - 通过管道实现进程间的数据传递。
+  
+  - 使用 `fork()` 创建子进程并进行数据处理。
+  
+  - 处理进程间的同步，确保数据在进程间正确传递。
+  
+- **理解了素数筛选算法的实现**:
+
+  - 利用管道和进程递归地筛选素数，通过逐步过滤掉非素数的倍数，逐步缩小数据范围。
+
+- **学会了处理进程和管道的资源管理**:
+
+  -  通过关闭不再使用的管道端口来防止资源泄漏。
+
+  -  正确地同步进程，确保所有子进程的任务完成后再退出。
+
+- **提升了调试和错误处理能力**:
+  - 通过实验中的错误和调试，提升了发现问题和解决问题的能力。
+  - 学会了使用系统调用的错误处理机制，确保程序的健壮性和可靠性。
+
+
+- **增强了对操作系统底层机制的理解**:
+  - 深入理解了操作系统中进程和管道的工作机制，加深了对系统调用和进程管理的理解。
+
 
 ### find ([moderate](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
 
 #### 实验目的
 
+- 编写 UNIX find 程序的简单版本：查找所有文件 在具有特定名称的目录树中。
+- 您的解决方案 应该在文件 `user/find.c` 中。
+
+#### 实验步骤
+
+1.进入user文件夹，创建find.c 的文件，代码如下：
+
+``````c
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+#include "kernel/fs.h"
+
+//在ls.c基础上修改
+void find(char *path, char *file)
+{   
+    //文件名缓冲区
+    char buf[512], *p;
+    //文件描述符
+    int fd;
+   
+    struct dirent de;
+    struct stat st;
+
+    //open() 函数打开路径，返回一个文件描述符
+    //错误返回 -1
+    if ((fd = open(path, 0)) < 0)
+    {
+        //无法打开此路径
+        fprintf(2, "find: cannot open %s\n", path);
+        return;
+    }
+
+    //fstat()返回文件的结点中的所有信息,获得一个已存在文件的模式，并将此模式赋值给它的副本
+    //错误返回 -1
+    if (fstat(fd, &st) < 0)
+    {
+        fprintf(2, "find: cannot stat %s\n", path);
+        //关闭文件描述符 fd
+        close(fd);
+        return;
+    }
+    
+    switch(st.type)
+    {
+        //目录类型不对
+        case T_FILE:
+            fprintf(2, "find: %s is not a directory\n", path);
+            break;
+        //目录类型正确
+        case T_DIR:
+            //路径过长放不入缓冲区
+            if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf)
+            {
+                fprintf(2, "find: path too long\n");
+                break;
+            }
+            //将path指向的字符串即绝对路径复制到buf
+            strcpy(buf, path);
+            //加 "/" 前缀
+            p = buf + strlen(buf);
+            *p++ = '/';
+            //读取fd
+            //判断read返回字节数与de长度相等
+            while(read(fd, &de, sizeof(de)) == sizeof(de))
+            {
+                if(de.inum == 0)
+                    continue;
+                //不要递归为 “.” 和 “..”
+                //字符串比较函数
+                if (!strcmp(de.name, ".") || !strcmp(de.name, ".."))
+                    continue;
+                //把文件名信息复制p
+                memmove(p, de.name, DIRSIZ);
+                //设置文件名结束符
+                p[DIRSIZ] = 0;
+                // stat 以文件名作为参数，返回一个已存在文件的模式，并将此模式赋值给它的副本
+                //出错，则返回 -1
+                if(stat(buf, &st) < 0)
+                {
+                    printf("find: cannot stat %s\n", buf);
+                    continue;
+                }
+                //目录类型
+                if (st.type == T_DIR)
+                {
+                    //递归查找
+                    find(buf, file);
+                }
+                //文件类型，查找成功
+                else if (st.type == T_FILE && !strcmp(de.name, file))
+                {
+                    //缓冲区存放的路径
+                    printf("%s\n", buf);
+                } 
+            }
+        break;
+    }
+    //关闭文件描述符
+    close(fd);
+    return;
+}
+
+
+int main(int argc, char *argv[])
+{
+  //如果参数不是3个
+  if(argc != 3)
+  {
+    write(2, "Incorrect number of characters\n", strlen("Incorrect number of characters\n"));
+    exit(1);
+  }
+  else
+  {
+    //寻找函数
+    find(argv[1], argv[2]);
+    exit(0);
+  }
+}
+
+``````
+
+- 在 `user/ls.c` 中
+-  `fmtname()` 函数，目的是将路径格式化为文件名，也就是把名字变成前面没有左斜杠 `/` ，仅仅保存文件名。
+- `ls()` 函数，首先函数里面声明了需要用到的变量，包括文件名缓冲区、文件描述符、文件相关的结构体等等。其次使用 `open()` 函数进入路径，判断此路径是文件还是文件名。
+- **头文件**:
+  - `kernel/types.h`、`kernel/stat.h`、`kernel/fs.h`：这些头文件定义了系统调用和数据结构，比如文件类型 `T_FILE` 和 `T_DIR`，文件状态 `stat`，以及目录项 `dirent` 等。
+  - `user/user.h`：包含用户态程序所需的函数，如 `open`、`fstat`、`stat`、`close` 等。
+- **`find` 函数**:
+  - **参数**:
+    - `path`: 需要搜索的目录路径。
+    - `file`: 需要查找的文件名。
+  - **流程**:
+    1. 使用 `open()` 打开指定路径，并返回一个文件描述符 `fd`。如果打开失败，打印错误信息并返回。
+    2. 使用 `fstat()` 获取路径对应文件的状态信息，判断它是文件还是目录。
+    3. 根据文件类型执行不同操作：
+       - 如果是文件类型 `T_FILE`，说明路径不是一个目录，打印错误信息。
+       - 如果是目录类型 `T_DIR`，则继续处理：
+         - 检查路径长度是否超过缓冲区限制。
+         - 使用 `read()` 读取目录项 `dirent`，跳过 `.` 和 `..` 两个特殊目录项。
+         - 对每个目录项，使用 `stat()`获取其状态信息：
+           - 如果是目录，递归调用 `find()` 函数继续查找。
+           - 如果是文件且文件名匹配，打印文件的完整路径。
+- **`main` 函数**:
+  - 检查命令行参数个数是否为3（程序名、目录路径、文件名）。
+  - 如果参数数量不正确，输出错误信息并退出。
+  - 否则调用 `find()` 函数执行查找操作。
+
+2. 更新 Makefile
+
+   在 Makefile 中找到 UPROGS 变量的定义，并添加 find
+
+3. 实验结果
+
+![image-20240827165218158](./assets/image-20240827165218158.png)
+
+![image-20240827170914809](./assets/image-20240827170914809.png)
+
+#### 实验中遇到的问题和解决方法
+
+1. **`No rule to make target 'user/_find', needed by 'fs.img'.`**
+
+   - **原因分析**: `Makefile` 中缺少构建目标 `user/_find` 的规则，或者文件路径不正确。此错误意味着 `make` 无法找到生成目标文件 `user/_find` 所需的规则。
+
+   - **解决方法**
+
+      通过在 Makefile中添加一条明确的规则来指定如何生成 
+
+     ```
+     user/_find\
+     ```
+
+     确保路径使用的是正斜杠 '/'，并且源文件路径正确。例如：
+
+     添加完这条规则后，重新运行即可解决该问题。
+
+2. 路径名中使用反斜杠导致的错误
+
+   - **原因分析**: 反斜杠 `'\'` 在 Unix 类系统中通常被用作转义字符，而不是路径分隔符。这可能导致路径解析错误。
+
+   - **解决方法**: 
+
+     将路径中的反斜杠替换为正斜杠 `'/'`，确保所有路径在 `Makefile` 和代码中都使用标准的 Unix 路径分隔符。
+
+3. **`find` 函数中无法正确递归查找文件**
+
+   - **原因分析**: 递归遍历目录时，可能出现路径拼接错误或目录项判断失误，导致查找功能异常。
+
+
+   - **解决方法**: 
+
+     检查代码中 `strcpy` 和 `strcat` 的使用，确保路径拼接正确。确保 `strcmp` 函数用于正确过滤 `.` 和 `..` 目录。
+
+
+#### 实验心得
+
+通过本次实验，我深入理解了 Unix 系统下的文件和目录操作，特别是 `open`, `stat`, `fstat`, 和 `read` 等系统调用的用法。构建一个简化的 `find` 命令让我更好地理解了文件系统的目录遍历机制以及递归算法在实际应用中的重要性。
+
+同时，在处理 `Makefile` 的过程中，我体会到了自动化构建工具的重要性。遇到的错误提醒我需要特别注意路径和文件名的正确性，以及构建规则的明确性。通过查阅文档和调试，我学会了如何排查和解决 `Makefile` 中的构建问题，这对以后的开发工作具有很大的帮助。
+
+总的来说，这次实验不仅加深了我对系统编程的理解，还提高了我分析和解决问题的能力。我更加意识到在编写和调试代码时，细节的把握和对问题的冷静分析是多么重要。
+
+### xargs ([moderate](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
+
+#### 实验目的
+
+- 编写 UNIX xargs 程序的简单版本：从 标准输入并为每行运行一个命令，将行提供为 参数添加到命令中。
+- 您的解决方案 应位于文件 `user/xargs.c` 中。
+
+#### 实验步骤
+
+1. 进入user文件夹，创建 xargs.c 的文件，代码如下：
+
+``````c
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+#include "kernel/param.h"
+
+int main(int argc, char *argv[]) 
+{
+    // 检查是否至少提供了一个命令参数
+    if (argc < 2) 
+    {
+        fprintf(2, "xargs: too few inputs\n");
+        exit(1);
+    }
+
+    // 存储命令和其参数的数组
+    int num_args = 0;
+    char *cmd_args[MAXARG];
+
+    // 将命令行参数（除了第一个）存储到 cmd_args 数组中
+    for (int i = 1; i < argc; ++i) 
+    {
+        cmd_args[num_args++] = argv[i];
+    }
+
+    int base_count = num_args; // 记录初始参数数量
+
+    char input_char; // 用于读取字符
+    char *current_param; // 当前参数的指针
+    char param_buffer[512]; // 缓冲区
+    current_param = param_buffer; // 初始化 current_param 指针
+    int buffer_index = 0; // 当前字符在缓冲区中的位置
+
+    // 从标准输入读取字符直到文件结束
+    while (read(0, &input_char, 1) > 0)
+    {
+        if (input_char == '\n') 
+        {
+            // 遇到换行符，结束当前参数
+            current_param[buffer_index] = '\0';
+            buffer_index = 0;
+
+            // 将当前参数添加到 cmd_args 数组中
+            cmd_args[num_args++] = current_param;
+            cmd_args[num_args] = 0; // 末尾添加 NULL 作为 exec 的参数结束标记
+
+            // 创建子进程并执行命令
+            if (fork()) 
+            {
+                // 父进程等待子进程完成
+                wait(0);
+            } 
+            else 
+            {
+                // 子进程执行指定的命令
+                exec(argv[1], cmd_args);
+                // 如果 exec 返回，说明失败，退出子进程
+                exit(1);
+            }
+
+            // 恢复 cmd_args 数组为原始状态
+            num_args = base_count;
+        } 
+        else if (input_char == ' ') 
+        {
+            // 遇到空格，结束当前参数
+            current_param[buffer_index] = '\0';
+            buffer_index = 0;
+            cmd_args[num_args++] = current_param;
+
+            // 准备处理下一个参数
+            char new_param_buffer[512];
+            current_param = new_param_buffer;
+        } 
+        else 
+        {
+            // 其他字符，添加到当前参数中
+            current_param[buffer_index++] = input_char;
+        }
+    }
+
+    // 程序正常退出
+    exit(0);
+}
+``````
+
+这个程序实现了一个类似于 `xargs` 的功能，用于从标准输入读取参数并将这些参数作为参数传递给指定的命令。
+
+- **检查命令行参数：**
+
+程序首先检查是否提供了至少一个命令参数。如果没有，程序将打印错误消息并退出。
+
+- **初始化命令和参数数组：**
+
+该数组用于存储命令及其参数。`MAXARG` 是一个常量，定义了可以传递给命令的最大参数数量。
+
+- **填充命令和初始参数：**
+
+将命令行参数（从第二个参数开始）存储到 `cmd_args` 数组中，并记录初始参数数量。
+
+- **从标准输入读取字符并处理参数：**
+
+`param_buffer` 用于暂存每个参数的字符，`current_param` 指向当前参数的缓冲区。
+
+- **处理每一行输入：**
+
+  - 当遇到换行符 (`'\n'`)，程序认为一个完整的参数已经结束，将其添加到 `cmd_args` 数组中，然后创建一个子进程来执行指定的命令。
+
+  - 遇到空格 (`' '`) 时，结束当前参数，将其添加到 `cmd_args` 数组中，并准备处理下一个参数。
+
+  - 其他字符直接添加到当前参数缓冲区。
+
+2. 更新 Makefile
+
+​	在 Makefile 中找到 UPROGS 变量的定义，并添加 xargs
+
+3.  实验结果
+
+   ![image-20240827181049051](./assets/image-20240827181049051.png)
+
+   ![image-20240827180219248](./assets/image-20240827180219248.png)
+
+#### 实验中遇到的问题和解决方法
+
+**参数缓冲区管理问题：**
+
+- **问题：** 代码在处理空格时创建了新的 `param_buffer`。这可能导致上一个参数的缓冲区被覆盖，因 `current_param` 指向的新缓冲区 `new_param_buffer` 是局部变量，在下次循环时会被覆盖。
+- **解决方法：** 使用 `current_param` 指向的缓冲区必须保持有效，或考虑使用动态分配内存来存储参数。
+
+**命令参数数量限制：**
+
+- **问题：** `MAXARG` 限制了参数数量，可能在处理大量参数时导致溢出。
+- **解决方法：** 增加 `MAXARG` 的大小或实现动态调整参数数量的方法。
+
+**错误处理：**
+
+- **问题：** `exec` 失败时没有明确错误信息。
+- **解决方法：** 在 `exec` 失败时打印错误信息，帮助调试。
+
+#### 实验心得
+
+1. **理解进程管理和参数传递：**
+   - 在实验过程中，更加深入地理解了进程创建 (`fork`) 和执行 (`exec`) 的机制，以及如何传递参数到子进程中。
+2. **缓冲区管理的重要性：**
+   - 处理输入时要特别注意缓冲区的生命周期和管理，避免由于局部变量重用导致的数据覆盖问题。
+3. **系统调用的实际应用：**
+   - 通过实际编写程序，理解了如何使用系统调用 `read`, `write`, `fork`, `exec`, 和 `wait` 等来实现功能。
+4. **调试技巧：**
+   - 通过调试工具和输出调试信息，帮助发现和解决代码中的问题，如内存管理问题和进程控制问题。
+
+
+
+## Lab2: system calls
+
+在上一个实验中，您使用了 systems 调用编写了一些实用程序。在 在本实验中，您将向 XV6 添加一些新的系统调用，这将有所帮助 您了解它们的工作原理，并将让您接触到一些 xv6 内核的内部结构。稍后将添加更多系统调用 实验室。
+
+要启动实验室，请切换到 syscall 分支：
+
+```
+git fetch
+git checkout syscall
+make clean
+```
+
+### System call tracing ([moderate](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
+
+#### 实验目的
+
+- 添加一个系统调用跟踪功能，该功能 可能会在调试后续实验时有所帮助。
+
+- 创建一个新的跟踪系统调用，它将控制跟踪。它应该 取一个参数，一个整数 “mask”，其位指定哪个 对 trace 的系统调用。
+- 例如，要跟踪 fork 系统调用， 程序调用 trace（1 << SYS_fork），其中 SYS_fork`是一个 来自 kernel/syscall.h 的 syscall 编号。
+- 修改 xv6 内核在每次系统调用即将 return，如果在掩码中设置了系统调用的号码。 该行应包含 进程 ID、系统调用的名称和 返回值;
+- 无需打印 System Call 参数。`trace` 系统调用应启用跟踪 对于调用它的进程以及它随后分叉的任何子进程， 但不应影响其他进程。
+
 #### 实验步骤
 
 #### 实验中遇到的问题和解决方法
 
 #### 实验心得
 
-### xargs ([moderate](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
+### Sysinfo ([moderate](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
 
 #### 实验目的
 
@@ -406,5 +1001,3 @@ xv6 没有 `ps` 命令，但是，如果您键入， 内核将打印有关每个
 #### 实验中遇到的问题和解决方法
 
 #### 实验心得
-
-
