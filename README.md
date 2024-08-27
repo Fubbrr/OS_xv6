@@ -961,6 +961,10 @@ int main(int argc, char *argv[])
 4. **调试技巧：**
    - 通过调试工具和输出调试信息，帮助发现和解决代码中的问题，如内存管理问题和进程控制问题。
 
+### Score
+
+![image-20240827211521823](./assets/image-20240827211521823.png)
+
 
 
 ## Lab2: system calls
@@ -988,11 +992,511 @@ make clean
 
 #### 实验步骤
 
+1. 作为系统调用，先要定义一个系统调用的序号。在 kernel/syscall.h 添加宏定义，模仿已经存在的系统调用序号的宏定义
+
+   定义 `SYS_trace` 如下：
+
+   ``````
+   #define SYS_trace 22
+   ``````
+
+   ![image-20240827191056836](./assets/image-20240827191056836.png)
+
+2. user 目录下的文件，官方已经给出了用户态的 trace 函数( user/trace.c )
+
+   直接在 user/user.h 文件中声明用户态可以调用 trace 系统调用
+
+   查看 trace.c 文件，可以看到 trace(atoi(argv[1])) < 0 ，即 trace 函数传入的是一个数字，并和 0 进行比较、
+
+   结合实验提示，我们知道传入的参数类型是 int ，并且由此可以猜测到返回值类型应该是 int 。
+
+   这样就可以把 trace 这个系统调用加入到内核中声明了：
+
+   打开 user/user.h，添加：
+
+   ``````
+   int trace(int);
+   ``````
+
+   ![image-20240827202701737](./assets/image-20240827202701737.png)
+
+3. 查看 user/usys.pl文件，这里 perl 语言会自动生成汇编语言 **usys.S** ，是用户态系统调用接口。所以在 **user/usys.pl** 文件加入下面的语句：
+
+   ``````
+   entry("trace");
+   ``````
+
+   ![image-20240827202644884](./assets/image-20240827202644884.png)
+
+4. 行 ecall 指令会跳转到kernel/syscall.c 中 syscall 那个函数处，执行此函数。下面是 syscall 函数的源码：
+
+   ``````c
+   void syscall(void)
+   {
+     int num;
+     struct proc *p = myproc();
+   
+     num = p->trapframe->a7;
+     if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+       p->trapframe->a0 = syscalls[num]();
+     } else {
+       printf("%d %s: unknown sys call %d\n",
+               p->pid, p->name, num);
+       p->trapframe->a0 = -1;
+     }
+   }
+   ``````
+
+   其中， num = p->trapframe->a7; 从寄存器 a7 中读取系统调用号，所以上面的 usys.S 文件就是系统调用用户态和内核态的切换接口。接下来是 p->trapframe->a0 = syscalls[num]\(); 语句，通过调用 syscalls[num\](); 函数，把返回值保存在了 a0 寄存器中。
+
+5. 我们看看 syscalls[num]\(); 函数，这个函数在当前文件中。该函数调用了系统调用命令。
+
+      ```c
+      static uint64 (*syscalls[])(void) = {
+        [SYS_fork]    sys_fork,
+        [SYS_exit]    sys_exit,
+        ...
+      }
+      ```
+
+      把新增的 trace 系统调用添加到函数指针数组 *syscalls[]
+
+      ![image-20240827203730673](./assets/image-20240827203730673.png)
+
+6. 在文件开头给内核态的系统调用 `trace` 加上声明，在 kernel/syscall.c 加上：
+
+   ```c
+   extern uint64 sys_trace(void);
+   ```
+
+   ![image-20240827203835131](./assets/image-20240827203835131.png)
+
+7. 在实现这个函数之前，我们可以看到实验最后要输出每个系统调用函数的调用情况，依照实验说明给的示例，可以知道最后输出的格式如下：<pid>: syscall <syscall_name> -> <return_value>
+   其中， <pid> 是进程序号， <syscall_name> 是函数名称， <return_value> 是该系统调用的返回值。
+
+   根据提示，我们的 trace 系统调用应该有一个参数，一个整数“mask(掩码)”，其指定要跟踪的系统调用。
+
+   我们在 kernel/proc.h 文件的 proc 结构体中，新添加一个变量 mask ，使得每一个进程都有自己的 mask ，即要跟踪的系统调用。
+
+   ```c
+   struct proc {
+    ...
+    int mask; // Mask
+   };
+   ```
+
+   ![image-20240827204150170](./assets/image-20240827204150170.png)
+
+8. 然后我们就可以在 kernel/sysproc.c 给出 sys_trace 函数的具体实现了，只要把传进来的参数给到现有进程的 mask 就好了：
+
+   ``````c
+   uint64
+   sys_trace(void)
+   {
+     int mask;
+     // 取 a0 寄存器中的值返回给 mask
+     if(argint(0, &mask) < 0)
+       return -1;
+     
+     // 把 mask 传给现有进程的 mask
+     myproc()->mask = mask;
+     return 0;
+   }
+   ``````
+
+   ![image-20240827204405870](./assets/image-20240827204405870.png)
+
+9. 接下来我们就要把输出功能实现，因为 RISCV 的 C 规范是把返回值放在 a0 中，所以我们只要在调用系统调用时判断是不是 mask 规定的输出函数，如果是就输出。
+
+   因为 proc 结构体(见 kernel/proc.h )里的 name 是整个线程的名字，不是函数调用的函数名称，所以我们不能用 p->name ，而要自己定义一个数组
+
+   在 kernel/syscall.c 中定义，系统调用名字一定要按顺序，第一个为空
+   ``````c
+   static char *syscall_names[] = {
+     "", "fork", "exit", "wait", "pipe", 
+     "read", "kill", "exec", "fstat", "chdir", 
+     "dup", "getpid", "sbrk", "sleep", "uptime", 
+     "open", "write", "mknod", "unlink", "link", 
+     "mkdir", "close", "trace"};
+   ``````
+
+   ![image-20240827204735814](./assets/image-20240827204735814.png)
+
+10. kernel/syscall.c 中的 syscall 函数中添加打印调用情况语句。 mask 是按位判断的，所以判断使用的是按位运算。
+
+   进程序号直接通过 p->pid 就可以取到，函数名称需要从我们刚刚定义的数组中获取，即 syscall_names[num] ，其中 num 是从寄存器 a7 中读取的系统调用号，系统调用的返回值就是寄存器 a0 的值了，直接通过 p->trapframe->a0 语句获取即可。
+
+   ``````c
+   if((1 << num) & p->mask) 
+      printf("%d: syscall %s -> %d\n", p->pid, syscall_names[num], p->trapframe->a0);
+   ``````
+
+   ![image-20240827205034618](./assets/image-20240827205034618.png)
+
+11. 在 kernel/proc.c 中 `fork` 函数调用时，添加子进程复制父进程的 `mask` 的代码：
+
+    ``````c
+    np->mask = p->mask;
+    ``````
+
+    ![image-20240827205558492](./assets/image-20240827205558492.png)
+
+12. 更新 Makefile
+
+    在 Makefile 中找到 UPROGS 变量的定义，并添加 $U/_trace\
+
+    ![image-20240827202940731](./assets/image-20240827202940731.png)
+
+13. 实验结果
+
+       ![image-20240827210542394](./assets/image-20240827210542394.png)
+
+       ![image-20240827210659870](./assets/image-20240827210659870.png)
+
+#### 实验中遇到的问题和解决方法
+
+1. **系统调用跟踪的实现细节**
+
+​	**问题**: 在实现系统调用跟踪功能时，可能会遇到如何正确地记录和输出系统调用信息的困难。
+
+​	**解决方法**:
+
+- 确保正确地在系统调用处理程序中添加跟踪代码。例如，在操作系统的系统调用处理程序中插入打印语句或日志记录功能。
+- 使用 `printf` 或类似函数将系统调用的参数、返回值等信息打印出来，以便跟踪。
+
+2. **系统调用表的维护**
+
+​	**问题**: 系统调用表没有正确更新或维护，导致系统调用跟踪信息不准确。
+
+​	**解决方法**:
+
+- 确保在系统调用表中正确地添加了新系统调用的条目，并且系统调用号与处理程序的映射是正确的。
+- 检查系统调用表的定义和更新代码，确保它们与实际实现一致。
+
+3. **系统调用参数的提取**
+
+​	**问题**: 在跟踪系统调用时，提取和解析系统调用参数会出错，导致输出信息不准确。
+
+​	**解决方法**:
+
+- 确保正确地从进程的寄存器或堆栈中提取系统调用参数。
+- 检查系统调用的参数传递方式（如寄存器传递或堆栈传递）并确保提取逻辑与实际参数传递方式一致。
+
+1. **深入理解系统调用的工作原理**:
+   - 通过实现系统调用跟踪功能，加深了对系统调用的理解，包括如何通过系统调用号和处理程序进行映射。
+   - 学习了如何在操作系统中插入和管理系统调用处理代码。
+2. **掌握系统调用调试技巧**:
+   - 在调试系统调用跟踪功能时，学会了使用调试工具（如 `gdb`）来排查问题。
+   - 体会到了系统调用调试中的挑战，例如如何处理系统调用参数的提取和记录。
+3. **理解操作系统的设计和实现**:
+   - 通过实现系统调用跟踪，理解了操作系统如何管理系统调用的执行，包括如何将系统调用与实际的处理程序关联起来。
+   - 认识到系统调用跟踪对操作系统的稳定性和性能的影响。
+4. **增强了代码的维护和管理能力**:
+   - 学会了如何正确更新和维护系统调用表，确保系统调用的正确性和可靠性。
+   - 提升了对操作系统内核代码的修改和扩展能力。
+5. **体验了实验的挑战和解决策略**:
+   - 在实验过程中遇到了各种挑战，例如系统调用跟踪信息不准确或系统崩溃，学会了如何通过仔细检查代码和调试工具来解决这些问题。
+   - 认识到系统调用跟踪是一个复杂的任务，需要细致的工作和准确的实现。
+
+通过系统调用跟踪实验，不仅提高了对操作系统内部机制的理解，还增强了调试和系统级编程的能力。这些经验和技能将为进一步的操作系统设计和开发打下坚实的基础。
+
+### Sysinfo ([moderate](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
+
+#### 实验目的
+
+- 在本实验中，您将添加一个系统调用 sysinfo ，它收集有关正在运行的系统信息。
+
+- 系统调用接受一个参数：一个指向 struct sysinfo 的指针(参见 kernel/sysinfo.h )。内核应该填写这个结构体的字段： freemem 字段应该设置为空闲内存的字节数， nproc 字段应该设置为状态不是 UNUSED 的进程数。
+- 我们提供了一个测试程序 sysinfotest ；如果它打印 “sysinfotest：OK” ，则实验结果通过测试。
+
+#### 实验步骤
+
+1. 定义一个系统调用的序号。系统调用序号的宏定义在 kernel/syscall.h 文件中。 kernel/syscall.h 添加宏定义 SYS_sysinfo 如下：
+
+   ``````c
+   #define SYS_sysinfo  23
+   ``````
+
+2. 
+   在 user/usys.pl 文件加入下面的语句：
+
+   ``````c
+   entry("sysinfo");
+   ``````
+
+3. 在 user/user.h 中添加 sysinfo 结构体以及 sysinfo 函数的声明：
+
+   ``````c
+   struct sysinfo;
+   
+   // system calls
+   int sysinfo(struct sysinfo *);
+   ``````
+
+4. 在 kernel/syscall.c 中新增 sys_sysinfo 函数的定义：
+
+   ``````c
+   extern uint64 sys_sysinfo(void);
+   ``````
+
+   函数指针数组新增 `sys_trace` ：
+
+   ``````c
+   [SYS_sysinfo]   sys_sysinfo,
+   ``````
+
+   syscall_names 新增一个 sys_trace ：
+
+   ``````c
+   static char *syscall_names[] = {
+     "", "fork", "exit", "wait", "pipe", 
+     "read", "kill", "exec", "fstat", "chdir", 
+     "dup", "getpid", "sbrk", "sleep", "uptime", 
+     "open", "write", "mknod", "unlink", "link", 
+     "mkdir", "close", "trace", "sysinfo"};
+   ``````
+
+5. 在 kernel/proc.c中新增函数 `nproc` 如下，通过该函数以获取可用进程数目：
+
+   ``````c
+   uint64
+   nproc(void)
+   {
+     struct proc *p;
+     uint64 num = 0;
+     for (p = proc; p < &proc[NPROC]; p++)
+     {
+       acquire(&p->lock);
+       if (p->state != UNUSED)
+       {
+         num++;
+       }
+       release(&p->lock);
+     }
+     return num;
+   }
+   ``````
+
+   用于统计操作系统中非 `UNUSED` 状态的进程数量。这个函数遍历了进程表中的所有进程，并且对每个进程获取锁，以确保在读取进程状态时没有其他进程正在修改它。
+
+6. 可以在 kernel/kalloc.c 中新增函数 `free_mem` ，以获取空闲内存数量：
+
+   通过这个函数，你可以计算系统中空闲内存的总量。函数通过遍历空闲内存块链表来统计内存块的数量，并通过加锁来保证在统计过程中不会出现并发问题。
+
+   ``````c
+   uint64
+   free_mem(void)
+   {
+     struct run *r;
+     uint64 num = 0;
+   
+     // 获取内存管理锁以确保线程安全
+     acquire(&kmem.lock);
+   
+     // 指向空闲内存块的链表头
+     r = kmem.freelist;
+   
+     // 遍历空闲内存块链表
+     while (r)
+     {
+       num++; // 每找到一个空闲内存块，计数器加1
+       r = r->next; // 移动到下一个内存块
+     }
+   
+     // 释放内存管理锁
+     release(&kmem.lock);
+   
+     // 返回空闲内存的总大小
+     // num 乘以每个页面的大小 PGSIZE
+     return num * PGSIZE;
+   }
+   ``````
+
+7. 在 kernel/defs.h 中添加上述两个新增函数的声明：
+
+   ``````c
+   // kalloc.c
+   uint64          free_mem(void);
+   // proc.c
+   uint64          nproc(void);
+   ``````
+
+8. 在 kernel/sysproc.c 文件中添加 `sys_sysinfo` 函数的具体实现如下：
+
+   sysinfo 需要将 `struct sysinfo` 复制回给 user 空间;参见 `sys_fstat（）` （`kernel/sysfile.c`） 和 `filestat（）` （`kernel/file.c`） 以获取示例，以了解如何操作 来做到这一点。
+
+   ``````c
+   #include "sysinfo.h"
+   
+   // 系统调用实现，返回系统信息
+   uint64
+   sys_sysinfo(void)
+   {
+     uint64 addr;            // 用户空间中接收系统信息的地址
+     struct sysinfo info;    // 用于存储系统信息的结构体
+     struct proc *p = myproc(); // 获取当前进程的指针
+   
+     // 从系统调用参数中获取地址
+     if (argaddr(0, &addr) < 0)
+       return -1; // 获取地址失败，返回 -1 表示错误
+   
+     // 获取系统信息
+     info.freemem = free_mem(); // 获取系统中空闲内存的总量
+     info.nproc = nproc();      // 获取系统中活跃进程的数量
+   
+     // 将系统信息复制到用户空间的指定地址
+     if (copyout(p->pagetable, addr, (char *)&info, sizeof(info)) < 0)
+       return -1; // 复制失败，返回 -1 表示错误
+   
+     return 0; // 成功，返回 0
+   }
+   ``````
+
+9. 在 user 目录下添加一个 sysinfo.c 程序：
+
+   ``````c
+   #include "kernel/param.h"  // 包含内核参数定义
+   #include "kernel/types.h"   // 包含通用类型定义
+   #include "kernel/sysinfo.h" // 包含 sysinfo 结构体定义
+   #include "user/user.h"      // 包含用户空间函数和系统调用定义
+   
+   int
+   main(int argc, char *argv[])
+   {
+       // 参数错误处理
+       if (argc != 1)
+       {
+           fprintf(2, "Usage: %s need not param\n", argv[0]);
+           exit(1); // 如果传递了参数，打印错误信息并退出
+       }
+   
+       struct sysinfo info; // 定义 sysinfo 结构体变量，用于存储系统信息
+   
+       // 调用 sysinfo 系统调用，获取系统信息
+       sysinfo(&info);
+   
+       // 打印系统信息中的空闲内存和活跃进程数量
+       printf("free space: %d\nused process: %d\n", info.freemem, info.nproc);
+   
+       exit(0); // 正常退出
+   }
+   ``````
+
+   这个程序使用 `sysinfo` 系统调用来获取系统的空闲内存和活跃进程数，并将这些信息打印出来。
+
+   通过检查命令行参数的数量，它确保程序正确地被调用。这个程序示例展示了如何从内核中提取系统级信息，并在用户空间进行处理和展示。
+
+10. 在 Makefile 的 `UPROGS` 中添加：
+
+    ```Makefile
+    $U/_sysinfotest\
+    $U/_sysinfo\
+    ```
+
+11. 实验结果
+
+    ![image-20240827214434879](./assets/image-20240827214434879.png)
+
+    ![image-20240827214304250](./assets/image-20240827214304250.png)
+
+      - free space: 133386240: 系统中剩余的空闲内存量，单位为字节。
+      - used process: 3: 当前系统中活跃的进程数量，这里是 3 个。
+
+      - sysinfotest: start: 表示测试程序 sysinfotest 开始运行。
+
+      - sysinfotest: OK: 表示测试通过，系统调用 sysinfo正常工作。
+
+    这段输出说明：
+
+    1. 你的操作系统成功启动，并能运行基本的 shell。
+    2. 你实现的 `sysinfo` 系统调用能够正确返回系统的空闲内存和活跃进程数量。
+    3. 你实现的 `sysinfo` 系统调用通过了 `sysinfotest` 的测试，验证了其功能的正确性。
+
+#### 实验中遇到的问题和解决方法
+
+1. **系统调用未正确注册的问题**:
+   - **问题**: 在实现 `sysinfo` 系统调用时，系统调用表可能未正确更新，导致在用户程序中调用 `sysinfo` 时出现错误，如未定义的系统调用或返回错误代码。
+   - **解决方法**: 检查系统调用的实现，确保在系统调用表中正确注册了 `sysinfo`。通常，这涉及到在 `syscall.h` 中添加相应的系统调用号，并在 `syscall.c` 中将系统调用号映射到具体的处理函数。此外，还需要确保用户空间的调用正确无误。
+
+2. **数据传输的内存地址错误**:
+   - **问题**: 在 `sysinfo` 系统调用中，将 `sysinfo` 结构体从内核传递到用户空间时，可能出现传输失败的情况，例如 `copyout` 函数返回错误。这通常是由于内存地址错误或权限问题引起的。
+   - **解决方法**: 检查传递的地址是否正确无误，确保用户空间传递的地址在其进程的地址空间内。同时，仔细检查 `copyout` 函数的使用，确保其正确地将内核数据复制到用户空间。
+
+3. **内核锁未正确处理**:
+   - **问题**: 在实现 `free_mem()` 函数时，如果没有正确处理内核锁，可能导致并发访问时的竞争条件，导致内存统计不准确或者系统崩溃。
+   - **解决方法**: 确保在访问内核中共享资源（如自由内存链表）时，正确使用锁进行同步。对资源加锁后再操作，操作完成后立即释放锁，避免死锁或竞争条件。
+
+4. **编译错误与警告**:
+   - **问题**: 在实现和测试 `sysinfo` 系统调用时，可能会遇到编译错误或警告，如类型不匹配、未定义的符号等。这些问题通常源于系统调用的定义与实现不一致。
+   - **解决方法**: 逐一检查代码的类型声明、系统调用表的配置，以及用户和内核空间数据传递的函数。确保各部分的一致性，并参考现有的系统调用实现，确保风格和用法一致。
+
+#### 实验心得
+
+通过本次实验，我深入理解了操作系统中的系统调用机制，特别是如何在一个精简的操作系统中实现新的系统调用。这个过程让我认识到系统调用不仅仅是用户与内核之间的桥梁，还是内核资源管理和系统状态查询的重要手段。
+
+在实验中，我遇到了一些实现和调试上的挑战，比如如何安全地在内核和用户空间之间传递数据、如何正确使用内核锁来防止竞争条件等。这些问题的解决让我掌握了更多操作系统内核编程的技巧，并加深了对操作系统设计的理解。
+
+另外，通过 `sysinfo` 系统调用的实现和测试，我还进一步熟悉了如何在操作系统中实现高效的资源管理与状态监控功能。这些经验对于将来设计和优化更复杂的操作系统功能非常有价值。
+
+总之，这次实验不仅巩固了我对操作系统核心概念的理解，也提升了我解决实际问题的能力，为后续的学习和研究打下了坚实的基础。
+
+### Score
+
+![image-20240827214337958](./assets/image-20240827214337958.png)
+
+
+
+## Lab3: page tables
+
+### Speed up system calls ([easy](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
+
+#### 实验目的
+
+某些操作系统（例如 Linux）通过共享 用户空间和内核之间的只读区域中的数据。这消除了 在执行这些系统调用时需要内核交叉。帮助您学习 如何将映射插入页表中，您的首要任务是实现此 优化了 XV6 中的 `getpid（）` 系统调用。
+
+创建每个进程后，在 USYSCALL 中映射一个只读页面（VA 定义的 在 `memlayout.h` 中）。在本页的开头，存储一个 `struct usys调用`（也在 `memlayout.h` 中定义），并将其初始化为存储 当前进程的 PID。在本实验中，`ugetpid（）` 已被 ，并将自动使用 USYSCALL 映射。 如果 `ugetpid` 测试 运行 `pgtbltest` 时大小写通过。
+
+#### 实验步骤
+
 #### 实验中遇到的问题和解决方法
 
 #### 实验心得
 
-### Sysinfo ([moderate](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
+
+
+### Print a page table ([easy](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
+
+#### 实验目的
+
+#### 实验步骤
+
+#### 实验中遇到的问题和解决方法
+
+#### 实验心得
+
+### Detecting which pages have been accessed ([hard](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
+
+#### 实验目的
+
+#### 实验步骤
+
+#### 实验中遇到的问题和解决方法
+
+#### 实验心得
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #### 实验目的
 
