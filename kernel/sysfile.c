@@ -484,3 +484,202 @@ sys_pipe(void)
   }
   return 0;
 }
+
+// sys_mmap() - 将文件映射到虚拟内存空间
+// 参数：
+//   va: 虚拟地址（程序提供的建议地址）
+//   len: 映射的长度（字节数）
+//   prot: 映射区域的保护权限（如读、写权限）
+//   flags: 映射选项（如是否共享）
+//   fd: 文件描述符，指向需要映射的文件
+//   off: 文件偏移量（从文件的哪个位置开始映射）
+// 返回值：
+//   成功时返回映射的虚拟地址，失败时返回 -1
+uint64 sys_mmap(void) {
+    uint64 va;         // 存储虚拟地址参数
+    int len, prot, flags, fd, off; // 存储映射长度、保护权限、映射标志、文件描述符和偏移量参数
+
+    // 从系统调用参数中获取各个参数的值，如果获取失败则返回 -1
+    if (argaddr(0, &va) < 0) return -1;
+    if (argint(1, &len) < 0 || argint(2, &prot) < 0
+        || argint(3, &flags) < 0 || argint(4, &fd) < 0)
+        return -1;
+    if (argint(5, &off) < 0) return -1;
+
+    // 参数检查和前置条件验证
+    struct proc *p = myproc();  // 获取当前进程结构体
+    if (len <= 0) return -1;    // 映射长度必须大于 0
+    if (p->ofile[fd] == 0) return -1; // 检查文件描述符是否有效
+    else filedup(p->ofile[fd]); // 增加文件的引用计数
+
+    // 检查映射的文件是否符合可写权限要求
+    if (p->ofile[fd]->writable == 0 &&  // 如果文件不可写
+        (prot & PROT_WRITE) == PROT_WRITE &&  // 并且请求了写权限
+        (flags & MAP_SHARED) == MAP_SHARED)   // 且映射是共享的
+        return -1;  // 返回 -1 表示不允许此映射
+
+    // 在进程的虚拟内存区域数组中分配一个 vma 结构体
+    int i;
+    for (i = 0; i < MAXVMA; ++i) {
+        if (p->vma[i].valid == 0) { // 找到一个空闲的 vma 结构体
+            p->vma[i].valid = 1;    // 标记为有效
+            break;
+        }
+    }
+    if (i == MAXVMA) return -1; // 如果没有空闲的 vma 结构体，返回 -1
+
+    // 设置 vma 结构体的各个字段
+    p->vma[i].va = p->curend - len;  // 分配一个新的虚拟地址
+    p->curend = p->vma[i].va;        // 更新当前进程的虚拟地址空间结束位置
+    p->vma[i].len = len;             // 设置映射长度
+    uint pteflags = 0;               // 初始化页表项标志位
+    if ((prot & PROT_READ) == PROT_READ) pteflags |= PTE_R; // 设置读权限
+    if ((prot & PROT_WRITE) == PROT_WRITE) pteflags |= PTE_W; // 设置写权限
+    p->vma[i].prot = pteflags;       // 设置 vma 的权限
+    p->vma[i].flags = flags;         // 设置映射标志
+    p->vma[i].fd = fd;               // 设置文件描述符
+    p->vma[i].off = off;             // 设置文件偏移量
+    p->vma[i].f = p->ofile[fd];      // 保存文件指针
+
+    return (uint64)p->vma[i].va;     // 返回映射的虚拟地址
+}
+
+// sys_munmap() - 解除文件与虚拟内存的映射
+// 参数：
+//   va: 要解除映射的虚拟地址
+//   len: 解除映射的长度（字节数）
+// 返回值：
+//   成功时返回 0，失败时返回 -1
+uint64 sys_munmap(void) {
+    uint64 va;  // 存储要解除映射的虚拟地址
+    int len;    // 存储解除映射的长度
+
+    // 从系统调用参数中获取 va 和 len 的值，如果获取失败则返回 -1
+    if (argaddr(0, &va) < 0) return -1;
+    if (argint(1, &len) < 0) return -1;
+
+    // 调用 subunmap 函数执行实际的解除映射操作
+    if (subunmap(va, len) == -1) return -1;
+
+    return 0; // 成功时返回 0
+}
+
+// pgfault() 处理页面错误。当进程访问的虚拟地址在其地址空间中
+// 没有映射时，会触发页面错误，此函数负责为该地址分配物理内存并建立映射。
+// 参数：va - 触发页面错误的虚拟地址。
+// 返回值：0 表示成功，-1 表示失败。
+uint64
+pgfault(uint64 va) {
+    struct proc *p = myproc();  // 获取当前进程
+    struct vma_t *v = 0;  // 初始化指向虚拟内存区域（VMA）的指针
+
+    // 遍历进程的 VMA 数组，寻找包含触发页面错误地址 va 的 VMA
+    for (int i = 0; i < MAXVMA; ++i) {
+        if (p->vma[i].valid == 1 && p->vma[i].va <= va
+            && va <= p->vma[i].va + p->vma[i].len) {
+            v = &p->vma[i];  // 找到匹配的 VMA
+            break;
+        }
+    }
+    if (v == 0) return -1;  // 如果未找到匹配的 VMA，返回错误
+
+    // 为触发页面错误的地址分配物理页，并将其映射到虚拟地址 va
+    uint64 pa = (uint64)kalloc();  // 分配一页物理内存
+    if (pa == 0) return -1;  // 内存分配失败，返回错误
+    memset((char *)pa, 0, PGSIZE);  // 将分配的内存清零
+
+    // 在进程的页表中建立 va 到 pa 的映射
+    if (mappages(p->pagetable, va, PGSIZE, pa, v->prot|PTE_U) == -1) {
+        kfree((void *)pa);  // 如果映射失败，释放已分配的物理内存
+        return -1;
+    }
+
+    // 从文件中读取数据并写入映射的内存
+    ilock(v->f->ip);  // 锁定文件的 inode
+    int ret = readi(v->f->ip, 1, va, v->off + va - v->va, PGSIZE);
+    if (ret == -1) {
+        kfree((void *)pa);  // 读取失败时释放内存
+        iunlock(v->f->ip);  // 释放 inode 锁
+        return -1;
+    }
+    iunlock(v->f->ip);  // 释放 inode 锁
+
+    return 0;  // 返回成功
+}
+
+// subunmap() 解除映射进程的虚拟内存区域。
+// 参数：va - 要解除映射的虚拟地址，len - 解除映射的长度。
+// 返回值：0 表示成功，-1 表示失败。
+uint64
+subunmap(uint64 va, int len) {
+    if (len == 0) return 0;  // 如果长度为 0，不做任何操作，直接返回成功
+    struct proc *p = myproc();  // 获取当前进程
+    struct vma_t *v = 0;  // 初始化指向 VMA 的指针
+
+    // 遍历进程的 VMA 数组，寻找包含要解除映射的地址 va 的 VMA
+    for (int i = 0; i < MAXVMA; ++i) {
+        if (p->vma[i].valid == 1 && p->vma[i].va <= va
+            && va <= p->vma[i].va + p->vma[i].len) {
+            v = &p->vma[i];  // 找到匹配的 VMA
+            break;
+        }
+    }
+    if (v == 0) return -1;  // 如果未找到匹配的 VMA，返回错误
+
+    // 检查 va 对应的页表项
+    va = PGROUNDDOWN(va);  // 将 va 向下对齐到页边界
+    pte_t *pte = walk(p->pagetable, va, 0);  // 获取对应的页表项
+    if (pte == 0) return -1;  // 如果页表项不存在，返回错误
+    uint64 pteflags = PTE_FLAGS(*pte);  // 获取页表项的标志位
+    uint64 pa;
+    if ((pa = walkaddr(p->pagetable, va)) != 0) {
+        // 如果已安装映射，检查是否需要写回到文件
+        if (v->flags & MAP_SHARED) {
+            if ((pteflags & PTE_D) == PTE_D) {
+                int ret = filewrite(v->f, va, len);
+                if (ret == -1) return -1;  // 写回失败，返回错误
+            }
+        }
+
+        // 解除映射
+        uvmunmap(p->pagetable, va, len / PGSIZE, 1);
+    }
+
+    // 根据是否部分或全部解除映射，调整 VMA 的起始地址和长度
+    if (v->va == va && v->len == len) {
+        // 完全解除映射
+        v->len -= len;
+    } else if (v->va == va && v->len != len) {
+        // 部分解除映射，解除文件开头部分
+        v->va += len;
+        v->len -= len;
+    } else if (v->va != va && v->len != len) {
+        // 部分解除映射，解除文件末尾部分
+        v->len -= len;
+    }
+
+    if (v->len == 0) {
+        // 如果完全解除映射，清空 VMA 并关闭文件
+        v->va = 0;
+        v->valid = 0;
+        fileclose(v->f);
+
+        // 调整 curend，使其指向未映射区域的末端
+        if (va == p->curend) {
+            p->curend += len;
+            for (uint64 unva = PGROUNDDOWN(p->curend);
+                unva < MAXVA - 2 * PGSIZE; unva += PGSIZE) {
+                // 遍历虚拟地址空间，调整 curend
+                int i;
+                for (i = 0; i < MAXVMA; ++i) {
+                    if (p->vma[i].va == unva && p->vma[i].valid == 1)
+                        break;
+                }
+                if (i == MAXVMA) p->curend += PGSIZE;  // 如果地址未被映射，继续调整 curend
+                else break;  // 如果找到已映射地址，停止调整 curend
+            }
+        }
+    }
+
+    return 0;  // 返回成功
+}
