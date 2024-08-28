@@ -401,6 +401,42 @@ bmap(struct inode *ip, uint bn)
     return addr;
   }
 
+  // 处理双重间接块的逻辑
+
+  bn -= NINDIRECT; // 计算相对于双重间接块的偏移量
+  if(bn < NDOUBLYINDIRECT) { // 如果偏移量在双重间接块范围内
+
+    // 获取双重间接块的地址
+    if((addr = ip->addrs[NDIRECT + 1]) == 0) {
+        // 如果双重间接块的地址尚未分配
+        ip->addrs[NDIRECT + 1] = addr = balloc(ip->dev); // 分配一个新的块
+    }
+    bp = bread(ip->dev, addr); // 读取双重间接块到缓冲区
+    a = (uint*)bp->data; // 获取双重间接块的数据
+
+    // 获取单重间接块的地址
+    if((addr = a[bn / NINDIRECT]) == 0) {
+        // 如果单重间接块的地址尚未分配
+        a[bn / NINDIRECT] = addr = balloc(ip->dev); // 分配一个新的块
+        log_write(bp); // 将修改记录到日志中
+    }
+    brelse(bp); // 释放缓冲区
+
+    bp = bread(ip->dev, addr); // 读取单重间接块到缓冲区
+    a = (uint*)bp->data; // 获取单重间接块的数据
+    bn %= NINDIRECT; // 计算在单重间接块中的偏移量
+
+    // 获取直接块的地址
+    if((addr = a[bn]) == 0) {
+        // 如果直接块的地址尚未分配
+        a[bn] = addr = balloc(ip->dev); // 分配一个新的块
+        log_write(bp); // 将修改记录到日志中
+    }
+    brelse(bp); // 释放缓冲区
+
+    return addr; // 返回直接块的地址
+  }
+
   panic("bmap: out of range");
 }
 
@@ -409,9 +445,9 @@ bmap(struct inode *ip, uint bn)
 void
 itrunc(struct inode *ip)
 {
-  int i, j;
-  struct buf *bp;
-  uint *a;
+  int i, j, k;
+  struct buf *bp, *bp1;
+  uint *a, *a1;
 
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
@@ -430,6 +466,28 @@ itrunc(struct inode *ip)
     brelse(bp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
+  }
+
+  if(ip->addrs[NDIRECT + 1]){
+    bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+    a = (uint*)bp->data;
+    for(j = 0; j < NINDIRECT; ++j) {
+      if(a[j]) {
+        bp1 = bread(ip->dev, a[j]);
+        a1 = (uint*)bp1->data;
+        for(k = 0; k < NINDIRECT; ++k) {
+          if(a1[k]) {
+            bfree(ip->dev, a1[k]);
+          }
+        }
+        brelse(bp1);
+        bfree(ip->dev, a[j]);
+        a[j] = 0;
+      }
+    }
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT + 1]);
+    ip->addrs[NDIRECT + 1] = 0;
   }
 
   ip->size = 0;
