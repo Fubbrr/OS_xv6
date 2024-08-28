@@ -16,6 +16,7 @@ char *mbufpull(struct mbuf *m, unsigned int len);
 char *mbufpush(struct mbuf *m, unsigned int len);
 char *mbufput(struct mbuf *m, unsigned int len);
 char *mbuftrim(struct mbuf *m, unsigned int len);
+void net_rx(struct mbuf *);
 
 // The above functions manipulate the size and position of the buffer:
 //            <- push            <- trim

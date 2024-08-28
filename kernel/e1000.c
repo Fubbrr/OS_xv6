@@ -95,26 +95,74 @@ e1000_init(uint32 *xregs)
 int
 e1000_transmit(struct mbuf *m)
 {
-  //
-  // Your code here.
-  //
-  // the mbuf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after sending.
-  //
-  
-  return 0;
+  // 获取 e1000 发送环的锁，确保线程安全
+    acquire(&e1000_lock);
+    
+    // 读取发送队列的尾指针（TDT，Transmit Descriptor Tail）
+    uint32 idx = regs[E1000_TDT]; 
+
+    // 检查当前描述符是否已经完成之前的发送任务
+    // 如果当前描述符的 status 位没有标记为完成，则返回错误
+    if ((tx_ring[idx].status & E1000_TXD_STAT_DD) == 0) {
+        release(&e1000_lock);
+        return -1;
+    }
+
+    // 如果当前描述符已经被使用，释放之前的缓冲区
+    if (tx_mbufs[idx]) {
+        mbuffree(tx_mbufs[idx]);
+    }
+
+    // 设置描述符的地址、长度和命令
+    tx_ring[idx].addr = (uint64)m->head; // 数据缓冲区的物理地址
+    tx_ring[idx].length = m->len;        // 数据长度
+    tx_ring[idx].cmd = E1000_TXD_CMD_RS   // 发送请求
+                        | E1000_TXD_CMD_EOP; // 结束包标志
+
+    // 将描述符与数据包关联
+    tx_mbufs[idx] = m;
+
+    // 更新发送队列的尾指针
+    regs[E1000_TDT] = (regs[E1000_TDT] + 1) % TX_RING_SIZE;
+
+    // 释放 e1000 发送环的锁
+    release(&e1000_lock);
+
+    return 0; // 成功
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver an mbuf for each packet (using net_rx()).
-  //
+    while (1) {
+        // 获取 e1000 接收环的锁，确保线程安全
+        acquire(&e1000_lock);
+        
+        // 计算下一个接收描述符的索引
+        uint32 idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+
+        // 检查接收描述符是否已准备好数据
+        // 如果未准备好数据，则释放锁并返回
+        if ((rx_ring[idx].status & E1000_RXD_STAT_DD) == 0) {
+            release(&e1000_lock);
+            return;
+        }
+
+        // 更新接收缓冲区的长度
+        rx_mbufs[idx]->len = rx_ring[idx].length;
+        
+        // 释放锁，处理接收到的数据
+        release(&e1000_lock);
+        net_rx(rx_mbufs[idx]); // 处理接收到的数据包
+
+        // 准备下一个接收缓冲区
+        rx_mbufs[idx] = mbufalloc(0);
+        rx_ring[idx].addr = (uint64)rx_mbufs[idx]->head; // 设置描述符地址
+        rx_ring[idx].status = 0; // 重置描述符状态
+
+        // 更新接收队列的尾指针
+        regs[E1000_RDT] = idx;
+    }
 }
 
 void
