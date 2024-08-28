@@ -22,16 +22,33 @@ barrier_init(void)
   bstate.nthread = 0;
 }
 
-static void 
-barrier()
+static void barrier()
 {
-  // YOUR CODE HERE
-  //
-  // Block until all threads have called barrier() and
-  // then increment bstate.round.
-  //
-  
+    // 锁定互斥量，确保对共享变量 bstate 的访问是线程安全的
+    pthread_mutex_lock(&bstate.barrier_mutex);
+    
+    // 将 bstate.nthread 加 1，表示当前线程已经到达了障碍点
+    bstate.nthread++;
+    
+    // 检查是否所有线程都已经到达障碍点
+    if (bstate.nthread == nthread) {
+        // 如果所有线程都已到达，将 nthread 重置为 0，为下一轮的同步做准备
+        bstate.nthread = 0;
+        
+        // 更新回合数，表示一个新的同步回合开始
+        bstate.round++;
+        
+        // 唤醒所有因等待条件变量而阻塞的线程
+        pthread_cond_broadcast(&bstate.barrier_cond);
+    } else {
+        // 如果不是所有线程都到达障碍点，则当前线程等待，直到其他线程到达
+        pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
+    }
+    
+    // 解锁互斥量，允许其他线程访问共享变量
+    pthread_mutex_unlock(&bstate.barrier_mutex);
 }
+
 
 static void *
 thread(void *xa)
