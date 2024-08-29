@@ -1451,7 +1451,7 @@ make clean
 
 
 
-## !!!!!!Lab3: page tables
+## Lab3: page tables
 
 在本实验中，您将探索页表并将其修改为 以加快某些系统调用的速度并检测已访问的页面。
 
@@ -2060,7 +2060,7 @@ RISC-V是一种流线型和高度模块化的指令集架构。其设计的简�
 
 
 
-## !!!!!!Lab5: Copy-on-Write Fork for xv6
+## Lab5: Copy-on-Write Fork for xv6
 
 虚拟内存提供了一定程度的间接性：内核可以 通过将 PTE 标记为无效或只读来拦截内存引用， 导致页面错误， 并且可以通过修改 PTE 来更改地址的含义。 计算机系统中有句话说，任何系统问题都可能 通过一定程度的间接性解决。懒惰分配实验室提供了一个 例。本实验探讨了另一个示例：copy-on write fork。
 
@@ -2096,20 +2096,225 @@ COW fork（） 释放实现 user 记忆有点棘手。给定的物理页面可�
 
    <img src="./assets/image-20240828012843562.png" alt="image-20240828012843562" style="zoom:80%;" />
 
-2. 根据提示，首先要修改uvmcopy() ，把子进程的虚拟地址映射到父进程的物理页表上，同时清理父子进程页表上的PTE_W位。
+2. 修改kernel/riscv.h，选取PTE中的保留位定义标记一个页面是否为COW Fork页面的标志位
 
-3. 44
+   ``````c
+   #define PTE_RSW (1L << 8)
+   #define NPAGE (((PHYSTOP) - (KERNBASE)) / (PGSIZE))
+   #define INDEX(p) (((p) - (KERNBASE)) / (PGSIZE))
+   ``````
 
-4. 44
+   `PTE_RSW` 定义了一个保留位，用于标记一个页面是否为 COW 页面。当该位被设置时，表示该页面是 COW 页面。
 
-5. 
+   `NPAGE` 计算了从 `KERNBASE` 开始到 `PHYSTOP` 之间的页面数量，即整个物理内存的页面数量。
 
+   `INDEX(p)` 用于根据物理地址 `p` 计算出其在 `refcr.arr` 数组中的索引，方便引用计数的管理。
+
+3. 在kernel/kalloc.c中，增加引用计数(物理页)，修改所有相关函数
+
+   ``````c
+   struct {
+       struct spinlock lock;
+       int arr[NPAGE];
+   } refcr;
+   
+   inline void
+   refinc(uint64 pa) {
+       acquire(&refcr.lock);
+       ++refcr.arr[INDEX(pa)];
+       release(&refcr.lock);
+   }
+   inline void
+   refdes(uint64 pa) {
+       acquire(&refcr.lock);
+       --refcr.arr[INDEX(pa)];
+       release(&refcr.lock);
+   }
+   inline void
+   refset(uint64 pa, int n) {
+       acquire(&refcr.lock);
+       refcr.arr[INDEX(pa)] = n;
+       release(&refcr.lock);
+   }
+   inline uint64
+   refget(uint64 pa) {
+       uint64 ref;
+       acquire(&refcr.lock);
+       ref = refcr.arr[INDEX(pa)];
+       release(&refcr.lock);
+       return ref;
+   }
+   void
+   kinit() {
+       ···
+       memset(refcr.arr, 0, NPAGE);
+       initlock(&refcr.lock, "refcr");
+   }
+   void
+   kfree(void *pa) {
+       ···
+       if ((int)refget((uint64)pa) > 1) {
+           refdes((uint64)pa);
+           return;
+       }
+       ···
+   }
+   void *
+   kalloc(void) {
+       ···
+       if(r) {
+           kmem.freelist = r->next;
+           refset((uint64)r, 1);
+       }
+   }
+   ``````
+
+   `refcr` 结构体包含一个自旋锁和一个数组，用于跟踪每个物理页面的引用计数。
+
+   `refinc()` 和 `refdes()` 分别用于增加和减少某个物理页面的引用计数。
+
+   `refset()` 用于设置某个物理页面的引用计数。
+
+   `refget()` 用于获取某个物理页面的当前引用计数。
+
+   `kfree()` 释放一个页面时，首先检查引用计数，如果引用计数大于1，只减少计数而不实际释放页面。
+
+   `kalloc()` 分配页面时，将引用计数初始化为1。
+
+4. 在kernel/defs.h中增加对应的函数声明
+
+   `````c
+   void   refinc(uint64);
+   void   refdes(uint64);
+   void   refset(uint64, int);
+   uint64 refget(uint64);
+   int    cowcopy(pagetable_t, uint64);
+   `````
+
+   在 `defs.h` 中声明了引用计数相关的函数和 `cowcopy()` 函数，以便在其他文件中使用。
+
+5. 在kernel/trap.c中，修改usertrap(void) 
+
+   ``````c
+   else if ((uint64)r_scause() == 15) {
+   	uint64 va = PGROUNDDOWN(r_stval());
+       if (va >= p->sz || cowcopy(p->pagetable, va) <= 0)
+   		p->killed = 1;
+   }
+   ``````
+
+   在用户陷阱处理函数中，当检测到页面错误（scause 为 15）时，获取导致错误的虚拟地址，并调用 `cowcopy()` 函数处理 COW 页面。如果处理失败，标记进程为 `killed`。
+
+6. 在kernel/vm.c中修改
+
+   ``````c
+   int
+   cowcopy(pagetable_t pg, uint64 va) {
+   
+       if (va >= MAXVA)    
+           return -1;
+       pte_t *pte = walk(pg, va, 0);
+       if (pte == 0)      
+           return -1;
+       if ((*pte & PTE_V) == 0)    
+           return -1;
+       if ((*pte & PTE_U) == 0)    
+           return -1;
+       if ((*pte & PTE_RSW) == 0)    
+           return 0;
+   
+       uint64 pa = walkaddr(pg, va);
+       if (pa == 0)    return -1;
+   
+       if ((int)refget(pa) == 1) {
+           *pte |= PTE_W;
+           *pte &= (~PTE_RSW);
+       } else {
+           char *mem;
+           if((mem = kalloc()) == 0) {
+               return -1;
+           } else {
+               memmove(mem, (char*)pa, PGSIZE);
+               uint flags = PTE_FLAGS(*pte);
+               flags |= PTE_W;
+               flags &= (~PTE_RSW);
+               if(mappages(pg, va, PGSIZE, (uint64)mem, flags) != 0) {
+                   kfree(mem);
+                   return -1;
+               }
+           }
+           kfree((uint64 *)pa);
+       }
+       return 1;
+   }
+   int
+   mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm) {
+       ...
+       //if(*pte & PTE_V)
+       //  panic("mappages: remap");
+       ...
+   }
+   int
+   uvmcopy(pagetable_t old, pagetable_t new, uint64 sz) {
+       //char *mem;
+   ···
+           *pte &= (~PTE_W);
+           *pte |= PTE_RSW;
+           flags = PTE_FLAGS(*pte);
+           if (mappages(new, i, PGSIZE, (uint64)pa, flags) != 0)
+               goto err;
+           refinc(pa);
+       ···
+   }
+   int
+   copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+   {
+      ··· 
+           if (cowcopy(pagetable, va0) == -1)
+               return -1;
+       ···
+   }
+   ``````
+
+   `cowcopy()` 函数用于处理 COW 页面。当引用计数为1时，直接将页面设置为可写；否则分配一个新页面并复制内容。
+
+   如果分配新页面失败或映射新页面时出错，则返回错误。
+
+   在 `mappages()` 中，注释掉了一个可能引发 panic 的检查，以支持页面的重映射。
+
+   在 `uvmcopy()` 中，复制页面表时标记 COW 页面，并增加引用计数。
+
+   在 `copyout()` 中，遇到 COW 页面时调用 `cowcopy()` 处理。
+
+7. 实验结果
+
+   - qemu下cowtest
+
+     ![image-20240829144638414](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829144638414.png)
+
+   - qemu下usertests
+
+     ![image-20240829144742102](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829144742102.png)
+
+   - 单项测试
+
+     ![image-20240829145056917](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829145056917.png)
 
 #### 实验中遇到的问题和解决方法
 
+实现 COW（Copy-On-Write）机制的过程中，遇到了以下问题和解决方法：
+
+1. **引用计数管理问题**：最初在实现引用计数时，未正确初始化和更新每个物理页面的引用计数，导致某些页面在释放时被过早回收。为解决此问题，添加了一个 `refcr` 结构体来管理引用计数，并在每次分配和释放页面时确保正确更新引用计数。
+2. **COW 页面标记问题**：在处理页面错误时，由于未正确标记 COW 页面，导致在发生写操作时无法正确识别需要复制的页面。为此，利用 `PTE_RSW` 标志位标记 COW 页面，并在发生页面错误时根据标志位进行正确处理。
+3. **页面复制错误**：在实现页面复制时，由于未正确设置新页面的标志位，导致新页面无法正确映射。通过仔细检查并调整页面的权限标志，确保新页面可以正常使用。
+
 #### 实验心得
 
+通过本次实验，我深入理解了 COW（Copy-On-Write）机制的实现原理及其在操作系统中的重要性。在实现过程中，我不仅学习到了如何通过标志位管理页面的状态，还掌握了如何利用引用计数来管理共享资源。这个实验使我认识到，操作系统中内存管理的精细程度直接影响系统的性能和稳定性，因此在编码时需要特别注意细节，以避免潜在的资源泄漏或数据错误。此外，调试过程中遇到的各种问题也让我更好地理解了内存管理的复杂性及其在系统中的关键作用。
+
 ### Score
+
+<img src="C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829145221860.png" alt="image-20240829145221860" style="zoom:67%;" />
 
 ## Lab6: Multithreading
 
@@ -2909,9 +3114,72 @@ make clean
 
 #### 实验步骤
 
+1. 添加有关 `symlink` 系统调用的定义声明. 包括 `kernel/syscall.h`, `kernel/syscall.c`, `user/usys.pl` 和 `user/user.h`
+
+   ``````c
+   #define SYS_symlink 22
+   
+   [SYS_symlink] sys_symlink,
+   
+   extern uint64 sys_symlink(void);
+   
+   entry("symlink");
+   
+   int symlink(char *target, char *path);
+   ``````
+
+2. 添加新的文件类型 `T_SYMLINK` 到 `kernel/stat.h` 中
+
+   ![image-20240829131157549](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829131157549.png)
+
+3. 添加新的文件标志位 `O_NOFOLLOW` 到 `kernel/fcntl.h` 中
+
+   ![image-20240829133948693](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829133948693.png)
+
+4. 在 `Makefile` 中添加对测试文件 `symlinktest.c` 的编译
+
+   <img src="C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829131452917.png" alt="image-20240829131452917" style="zoom:67%;" />
+
+5. 在 `kernel/sysfile.c` 中实现 `sys_symlink()` 函数，该函数即用来生成符号链接，存储的数据即目标文件的路径
+   通过 create() 创建符号链接路径对应的 inode 结构(同时使用 T_SYMLINK 与普通的文件进行区分).
+
+   通过 writei() 将链接的目标文件的路径写入 inode (的 block)中即可，无需判断连接的目标路径是否有效.
+   <img src="C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829134441841.png" alt="image-20240829134441841" style="zoom:80%;" />
+
+6. 修改 `kernel/sysfile.c `的 `sys_open()` 函数，该函数使用来打开文件的, 对于符号链接一般情况下需要打开的是其链接的目标文件, 因此需要对符号链接文件进行额外处理. 
+
+   在跟踪符号链接时需要额外考虑到符号链接的目标可能还是符号链接, 此时需要递归的去跟踪目标链接直至得到真正的文件. 而这其中需要解决两个问题: 
+
+   - 符号链接可能成环, 这样会一直递归地跟踪下去, 因此需要进行成环的检测;
+   - 对链接的深度进行限制, 以减轻系统负担
+
+   <img src="C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829134737968.png" alt="image-20240829134737968" style="zoom:80%;" />
+
+7. 实验结果
+
+   - qemu下symlinktest
+
+     ![image-20240829135056909](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829135056909.png)
+
+   - qemu下usertests
+
+     <img src="C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829135404271.png" alt="image-20240829135404271" style="zoom:67%;" />
+
+   - ./grade-lab-fs symlinktest
+
+     <img src="C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829135024520.png" alt="image-20240829135024520" style="zoom:67%;" />
+
 #### 实验中遇到的问题和解决方法
 
+在实现符号链接功能的过程中，主要遇到了两个问题。首先是路径解析失败的问题，即在解析符号链接时，可能会遇到目标路径不存在的情况。这通常是由于符号链接指向了一个错误或不存在的路径，导致无法正确解析目标文件。为了解决这一问题，需要确保符号链接的目标路径有效且存在。其次是符号链接的循环引用问题，即符号链接链条中可能出现自我引用或循环引用的情况，导致无限递归。通过在解析符号链接时记录已访问的inode编号，并在检测到循环引用时及时终止解析，避免了无限递归的发生。
+
 #### 实验心得
+
+通过此次实验，我深入理解了符号链接在文件系统中的实现原理，以及在实际操作系统中如何处理路径解析和防止循环引用的问题。这次实验不仅让我掌握了如何在XV6系统中添加和管理符号链接，还让我意识到在设计文件系统时必须考虑边界情况和潜在的错误处理，以确保系统的健壮性和可靠性。这些经验为我在将来开发复杂系统功能时提供了宝贵的参考。
+
+### Score
+
+![image-20240829135818903](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20240829135818903.png)
 
 ## Lab10: mmap ([hard](https://pdos.csail.mit.edu/6.828/2021/labs/guidance.html))
 
