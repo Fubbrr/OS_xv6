@@ -59,3 +59,4 @@ struct dirent {
   char name[DIRSIZ];
 };
 
+#define NSYMLINK 10
